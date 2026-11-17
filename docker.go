@@ -167,7 +167,9 @@ var healthRe = regexp.MustCompile(`\((healthy|unhealthy|health: starting)\)`)
 func (d *dockerClient) collect(tick int) *DockerState {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if tick%2 != 0 && d.cache != nil {
+	// Full per-container stats while someone is looking; otherwise just
+	// keep the running/total counts fresh every few ticks.
+	if d.cache != nil && !detailMode.Load() && tick%3 != 0 {
 		return d.cache
 	}
 	st := &DockerState{Engine: d.engine, Version: d.version}
@@ -235,6 +237,12 @@ func (d *dockerClient) collect(tick int) *DockerState {
 		}
 		return a.Name < b.Name
 	})
+	for _, c := range st.Containers {
+		st.Total++
+		if c.State == "running" {
+			st.Running++
+		}
+	}
 	d.cache = st
 	return st
 }

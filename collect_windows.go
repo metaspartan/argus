@@ -840,11 +840,11 @@ func (c *Collector) Collect(tick int) *Metrics {
 	}
 	m.FS = c.fsCache
 
-	if tick%everyProcs == 0 {
+	if heavyTick(tick, everyProcs) {
 		m.Procs = c.processes()
 	}
 
-	if tick%everyTCP == 0 {
+	if heavyTick(tick, everyTCP) {
 		c.tcpCache = tcpStates()
 	}
 	m.TCP = c.tcpCache

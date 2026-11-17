@@ -29,7 +29,8 @@ type Static struct {
 	Drivers     []Driver          `json:"drivers,omitempty"`
 	Extra       map[string]string `json:"extra,omitempty"`
 	Agent       string            `json:"agent"`
-	Manage      bool              `json:"manage"` // agent accepts exec/power/kill
+	Manage      bool              `json:"manage"`         // agent accepts any management command
+	Caps        []string          `json:"caps,omitempty"` // exec, docker, kill, power, update
 	Virtual     string            `json:"virt,omitempty"`
 	Timezone    string            `json:"tz,omitempty"`
 	CollectedAt int64             `json:"collectedAt"`
@@ -117,6 +118,8 @@ type DockerState struct {
 	Driver     string      `json:"driver,omitempty"`
 	Containers []Container `json:"containers"`
 	Error      string      `json:"error,omitempty"`
+	Running    int         `json:"running"`
+	Total      int         `json:"total"`
 }
 
 type Container struct {
@@ -235,4 +238,5 @@ type ReportResp struct {
 	Cmds       []Command `json:"cmds,omitempty"`
 	NeedStatic bool      `json:"needStatic,omitempty"`
 	Interval   int       `json:"interval,omitempty"` // ms
+	Detail     bool      `json:"detail,omitempty"`   // someone is viewing this machine: collect processes etc.
 }

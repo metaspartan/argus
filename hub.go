@@ -115,6 +115,9 @@ type Hub struct {
 
 	localID   string
 	localWake chan struct{}
+	adminNets cidrList
+	shaMu     sync.Mutex
+	shaCache  map[string][2]string // path -> [modtime, sha256]
 }
 
 func runHub(c *config) {
@@ -122,7 +125,8 @@ func runHub(c *config) {
 		fatal("data dir: %v", err)
 	}
 	h := &Hub{cfg: c, nodes: map[string]*node{}, subs: map[*sub]struct{}{}, focus: map[string]int{},
-		sessions: newSessionStore(c.Data), lim: newLimiter(), audit: openAudit(c.Data), localWake: make(chan struct{}, 1)}
+		sessions: newSessionStore(c.Data), lim: newLimiter(), audit: openAudit(c.Data), localWake: make(chan struct{}, 1),
+		adminNets: parseCIDRs(c.AdminCIDR), shaCache: map[string][2]string{}}
 	h.admin = c.AdminToken
 	if h.admin == "" {
 		h.admin = readOrCreateSecret(filepath.Join(c.Data, "admin.token"), 24)
@@ -150,6 +154,11 @@ func runHub(c *config) {
 	mux.HandleFunc("GET /api/stream", h.auth(h.handleStream))
 	mux.HandleFunc("GET /api/info", h.auth(h.handleInfo))
 	mux.HandleFunc("POST /api/enroll/rotate", h.auth(h.handleRotate))
+	mux.HandleFunc("GET /api/audit", h.auth(h.handleAudit))
+	mux.HandleFunc("POST /api/sessions/revoke", h.auth(h.handleRevokeSessions))
+	mux.HandleFunc("GET /api/auth", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"totp": totpEnabled(h.cfg.Data)})
+	})
 	mux.HandleFunc("GET /install.sh", h.handleInstallSh)
 	mux.HandleFunc("GET /install.ps1", h.handleInstallPs1)
 	mux.HandleFunc("GET /dl/{file}", h.handleDownload)
@@ -164,6 +173,7 @@ func runHub(c *config) {
 	srv := &http.Server{
 		Addr:              c.Listen,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          nil,
@@ -197,7 +207,7 @@ func runHub(c *config) {
 		h.tlsMode, h.pin, h.certHex = "auto", spkiPin(leaf), certSHA256Hex(leaf)
 		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
 	}
-	srv.Handler = secureHeaders(mux, h.tlsMode != "off")
+	srv.Handler = secureHeaders(gzipped(h.gate(mux)), h.tlsMode != "off")
 
 	logf("argus hub %s listening on %s (tls=%s, data %s)", version, c.Listen, h.tlsMode, c.Data)
 	logf("dashboard:   %s", h.baseURLs()[0])
@@ -302,9 +312,9 @@ func (h *Hub) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many attempts — try again in a few minutes", 429)
 		return
 	}
-	var body struct{ Token string }
+	var body struct{ Token, Code string }
 	json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
-	if !ctEq(strings.TrimSpace(body.Token), h.admin) {
+	if !ctEq(strings.TrimSpace(body.Token), h.admin) || !totpVerify(h.cfg.Data, body.Code) {
 		h.lim.fail(ip)
 		h.audit.log(ip, "login-failed", "", "")
 		time.Sleep(400 * time.Millisecond)
@@ -445,7 +455,12 @@ func (h *Hub) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var rep Report
-	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(&rep); err != nil || rep.ID != id {
+	body, done, err := gzipBody(r, 8<<20)
+	if err == nil {
+		err = json.NewDecoder(body).Decode(&rep)
+	}
+	done()
+	if err != nil || rep.ID != id {
 		http.Error(w, "bad report", 400)
 		return
 	}
@@ -470,11 +485,11 @@ func (h *Hub) handlePoll(w http.ResponseWriter, r *http.Request) {
 	cmds := n.cmds
 	n.cmds = nil
 	h.mu.Unlock()
-	writeJSON(w, &ReportResp{Cmds: cmds, Interval: h.intervalFor(id)})
+	writeJSON(w, &ReportResp{Cmds: cmds, Interval: h.intervalFor(id), Detail: h.focused(id)})
 }
 
 func (h *Hub) ingest(rep *Report, addr string, local bool) *ReportResp {
-	resp := &ReportResp{Interval: h.intervalFor(rep.ID)}
+	resp := &ReportResp{Interval: h.intervalFor(rep.ID), Detail: h.focused(rep.ID)}
 	now := time.Now().UnixMilli()
 	h.mu.Lock()
 	n := h.nodes[rep.ID]
@@ -502,7 +517,7 @@ func (h *Hub) ingest(rep *Report, addr string, local bool) *ReportResp {
 		resp.NeedStatic = true
 	}
 	n.Seen, n.Addr, n.Local = now, addr, local
-	var mEv []byte
+	var mEv, mLite []byte
 	if rep.M != nil {
 		n.Last = rep.M
 		p := summarize(rep.M, n.virt)
@@ -523,6 +538,7 @@ func (h *Hub) ingest(rep *Report, addr string, local bool) *ReportResp {
 		}
 		n.accN++
 		mEv, _ = json.Marshal(map[string]any{"id": rep.ID, "m": rep.M, "p": p, "seen": now, "iv": resp.Interval})
+		mLite, _ = json.Marshal(map[string]any{"id": rep.ID, "m": liteMetrics(rep.M), "p": p, "seen": now, "iv": resp.Interval})
 	}
 	var resEv [][]byte
 	for _, res := range rep.Results {
@@ -542,7 +558,7 @@ func (h *Hub) ingest(rep *Report, addr string, local bool) *ReportResp {
 		h.broadcast("node", staticEv)
 	}
 	if mEv != nil {
-		h.broadcast("m", mEv)
+		h.broadcastFocus(rep.ID, mEv, mLite)
 	}
 	for _, b := range resEv {
 		h.broadcast("result", b)
@@ -595,7 +611,8 @@ func (h *Hub) localAgent() {
 		if h.cfg.Name != "" {
 			st.Hostname = h.cfg.Name
 		}
-		st.Manage = h.cfg.Manage
+		st.Caps = h.cfg.caps()
+		st.Manage = len(st.Caps) > 0
 		if dk != nil {
 			st.Extra["Container engine"] = dk.describe()
 		}
@@ -604,7 +621,7 @@ func (h *Hub) localAgent() {
 	st := staticFn()
 	h.localID = st.ID
 	var stMu sync.Mutex
-	ex := &executor{manage: h.cfg.Manage, docker: dk, onDone: func(r Result) {
+	ex := &executor{caps: h.cfg.caps(), docker: dk, onDone: func(r Result) {
 		h.ingest(&Report{ID: st.ID, Results: []Result{r}}, "local", true)
 	}, refresh: func() {
 		ns := staticFn()
@@ -619,6 +636,7 @@ func (h *Hub) localAgent() {
 	sent := false
 	lastNIC := nicFingerprint()
 	for tick := 0; ; tick++ {
+		detailMode.Store(h.focused(st.ID))
 		m := col.Collect(tick)
 		if dk != nil {
 			m.Docker = dk.collect(tick)
@@ -695,7 +713,7 @@ func (h *Hub) handleNodes(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.RUnlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	writeJSON(w, map[string]any{"now": time.Now().UnixMilli(), "nodes": out})
+	writeJSON(w, map[string]any{"now": time.Now().UnixMilli(), "nodes": out, "version": version})
 }
 
 func (h *Hub) handleNode(w http.ResponseWriter, r *http.Request) {
@@ -726,7 +744,7 @@ func (h *Hub) handleDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 
-var validKinds = map[string]bool{"exec": true, "kill": true, "reboot": true, "shutdown": true, "inventory": true, "docker": true}
+var validKinds = map[string]bool{"exec": true, "kill": true, "reboot": true, "shutdown": true, "inventory": true, "docker": true, "upgrade": true}
 
 func (h *Hub) handleCmd(w http.ResponseWriter, r *http.Request) {
 	var c Command
@@ -893,6 +911,11 @@ func (h *Hub) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	s := &sub{ch: make(chan []byte, 256), focus: r.URL.Query().Get("focus")}
 	h.subsMu.Lock()
+	if len(h.subs) >= 200 {
+		h.subsMu.Unlock()
+		http.Error(w, "too many dashboard connections", 503)
+		return
+	}
 	first := len(h.subs) == 0
 	h.subs[s] = struct{}{}
 	if s.focus != "" {
@@ -1068,6 +1091,8 @@ func (h *Hub) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", "attachment; filename="+name)
+	w.Header().Set("X-Argus-SHA256", h.sha(p))
+	w.Header().Set("X-Argus-Version", version)
 	http.ServeFile(w, r, p)
 }
 
@@ -1133,3 +1158,101 @@ if ($Name) { $a += @('--name', $Name) }
 & $tmp @a
 Remove-Item $tmp -Force -ErrorAction SilentlyContinue
 `
+
+// ---------------------------------------------------------------- additions
+
+func (h *Hub) focused(id string) bool {
+	h.subsMu.Lock()
+	defer h.subsMu.Unlock()
+	return h.focus[id] > 0
+}
+
+// liteMetrics strips what the fleet overview never shows (process tables,
+// per-core arrays, per-container rows, filesystems) so every open dashboard
+// receives a few hundred bytes per machine instead of kilobytes.
+func liteMetrics(m *Metrics) *Metrics {
+	l := *m
+	l.Procs, l.Cores, l.FS, l.Disks, l.TCP, l.Fans = nil, nil, nil, nil, nil, nil
+	if m.Docker != nil {
+		d := *m.Docker
+		d.Containers = nil
+		l.Docker = &d
+	}
+	return &l
+}
+
+// broadcastFocus sends the full event to dashboards viewing this machine and
+// the lite event to everyone else.
+func (h *Hub) broadcastFocus(id string, full, lite []byte) {
+	frame := func(data []byte) []byte {
+		msg := make([]byte, 0, len(data)+16)
+		msg = append(msg, "event: m\ndata: "...)
+		msg = append(msg, data...)
+		return append(msg, "\n\n"...)
+	}
+	f, l := frame(full), frame(lite)
+	h.subsMu.Lock()
+	for s := range h.subs {
+		msg := l
+		if s.focus == id {
+			msg = f
+		}
+		select {
+		case s.ch <- msg:
+		default:
+		}
+	}
+	h.subsMu.Unlock()
+}
+
+// gate hides the dashboard and its API from networks outside --admin-cidr.
+// Agent, installer and download routes stay reachable for enrollment.
+func (h *Hub) gate(next http.Handler) http.Handler {
+	if len(h.adminNets) == 0 {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !agentPath(r.URL.Path) && !h.adminNets.allows(h.ip(r)) {
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (h *Hub) sha(p string) string {
+	st, err := os.Stat(p)
+	if err != nil {
+		return ""
+	}
+	key := st.ModTime().String()
+	h.shaMu.Lock()
+	defer h.shaMu.Unlock()
+	if c, ok := h.shaCache[p]; ok && c[0] == key {
+		return c[1]
+	}
+	sum := fileSHA256(p)
+	h.shaCache[p] = [2]string{key, sum}
+	return sum
+}
+
+func (h *Hub) handleAudit(w http.ResponseWriter, r *http.Request) {
+	b, _ := os.ReadFile(filepath.Join(h.cfg.Data, "audit.log"))
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) > 300 {
+		lines = lines[len(lines)-300:]
+	}
+	out := make([]json.RawMessage, 0, len(lines))
+	for i := len(lines) - 1; i >= 0; i-- {
+		if json.Valid([]byte(lines[i])) {
+			out = append(out, json.RawMessage(lines[i]))
+		}
+	}
+	writeJSON(w, map[string]any{"entries": out, "totp": totpEnabled(h.cfg.Data), "adminCidr": h.cfg.AdminCIDR, "tls": h.tlsMode})
+}
+
+func (h *Hub) handleRevokeSessions(w http.ResponseWriter, r *http.Request) {
+	h.sessions.clear()
+	h.audit.log(h.ip(r), "sessions-revoked", "", "all dashboard sessions signed out")
+	w.WriteHeader(204)
+}

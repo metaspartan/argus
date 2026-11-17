@@ -423,7 +423,7 @@ func (c *Collector) Collect(tick int) *Metrics {
 	}
 	m.FS = c.fsCache
 
-	if tick%everyProcs == 0 {
+	if heavyTick(tick, everyProcs) {
 		m.Procs, m.NProcs = c.processes()
 	}
 

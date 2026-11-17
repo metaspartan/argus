@@ -5,7 +5,7 @@ WORKDIR /src
 COPY go.mod ./
 COPY *.go *.s ./
 COPY web ./web
-ARG VERSION=0.2.0
+ARG VERSION=0.3.0
 RUN set -e; mkdir -p /out/dist; \
     for t in linux/amd64 linux/arm64 linux/riscv64 linux/arm darwin/arm64 darwin/amd64 windows/amd64 windows/arm64 freebsd/amd64; do \
       os=${t%/*}; arch=${t#*/}; ext=""; [ "$os" = windows ] && ext=".exe"; \

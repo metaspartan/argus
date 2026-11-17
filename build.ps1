@@ -1,7 +1,7 @@
 # Cross-compile static, dependency-free binaries for every supported target into dist\.
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-$version = if ($env:VERSION) { $env:VERSION } else { '0.2.0' }
+$version = if ($env:VERSION) { $env:VERSION } else { '0.3.0' }
 New-Item -ItemType Directory -Force dist | Out-Null
 $targets = 'linux/amd64','linux/arm64','linux/riscv64','linux/arm','darwin/arm64','darwin/amd64','windows/amd64','windows/arm64','freebsd/amd64'
 foreach ($t in $targets) {

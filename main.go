@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var version = "0.2.0"
+var version = "0.3.0"
 
 const usage = `argus %s — dependency-free fleet monitor
 
@@ -22,7 +22,9 @@ Usage:
                  [--host NAME,...] [--no-local] [--manage] [--trust-proxy]
   argus agent    --hub https://HOST:7070 --token ENROLL [--pin sha256/...] [--manage]
   argus install  hub|agent [flags]    install as a service (systemd/OpenRC/launchd/Task Scheduler)
-  argus uninstall                     remove services
+  argus uninstall [--purge]           remove services (--purge also deletes keys, tokens, data)
+  argus status                        service state, hub connectivity, enrollment
+  argus totp     enable|disable       two-factor (TOTP) dashboard login
   argus token    [--data DIR] [--rotate-admin] [--rotate-enroll]   show / rotate hub secrets
   argus snapshot                      print local inventory + metrics as JSON
   argus version
@@ -34,6 +36,8 @@ type config struct {
 	TLS, TLSCert, TLSKey, Hosts   string
 	URL                           string
 	Manage, NoLocal, TrustProxy   bool
+	Allow, AdminCIDR              string
+	Purge                         bool
 	RotateAdmin, RotateEnroll     bool
 	Interval, Idle                time.Duration
 }
@@ -53,7 +57,10 @@ func parseFlags(args []string) *config {
 	fs.StringVar(&c.Hub, "hub", os.Getenv("ARGUS_HUB"), "agent: hub URL")
 	fs.StringVar(&c.Pin, "pin", os.Getenv("ARGUS_PIN"), "agent: hub certificate public-key pin (sha256/...) for self-signed hubs")
 	fs.StringVar(&c.State, "state", "", "agent: state directory (agent key)")
-	fs.BoolVar(&c.Manage, "manage", false, "allow remote management (exec, containers, kill, reboot, shutdown)")
+	fs.BoolVar(&c.Manage, "manage", false, "allow all remote management (same as --allow exec,docker,kill,power,update)")
+	fs.StringVar(&c.Allow, "allow", "", "agent: granular management capabilities, comma separated: exec,docker,kill,power,update")
+	fs.StringVar(&c.AdminCIDR, "admin-cidr", os.Getenv("ARGUS_ADMIN_CIDR"), "hub: only serve the dashboard to these networks, e.g. 100.64.0.0/10,192.168.0.0/16 (agents are unaffected)")
+	fs.BoolVar(&c.Purge, "purge", false, "uninstall: also delete data, keys and tokens")
 	fs.BoolVar(&c.NoLocal, "no-local", false, "hub: don't monitor the hub machine itself")
 	fs.BoolVar(&c.TrustProxy, "trust-proxy", false, "hub: trust X-Forwarded-For / -Proto from a reverse proxy")
 	fs.BoolVar(&c.RotateAdmin, "rotate-admin", false, "token: generate a new admin token (logs everyone out)")
@@ -95,7 +102,15 @@ func main() {
 		}
 		installService(args[0], args[1:])
 	case "uninstall":
-		uninstallService()
+		uninstallService(parseFlags(args).Purge)
+	case "status":
+		statusCmd(parseFlags(args))
+	case "totp", "2fa":
+		action := ""
+		if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+			action, args = args[0], args[1:]
+		}
+		totpCmd(parseFlags(args).Data, action)
 	case "token", "tokens":
 		c := parseFlags(args)
 		admin, enroll := filepath.Join(c.Data, "admin.token"), filepath.Join(c.Data, "enroll.token")

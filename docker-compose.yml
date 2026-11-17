@@ -21,7 +21,11 @@ services:
       - "7070:7070"
     environment:
       ARGUS_URL: ${ARGUS_URL:-}
+      ARGUS_ADMIN_CIDR: ${ARGUS_ADMIN_CIDR:-}
     command: ["hub", "--data", "/data", "--dist", "/dist", "--no-local", "--host", "${ARGUS_HOST:-localhost}"]
+    # Optional hardening: only serve the dashboard to your LAN / Tailscale (agents still enroll from anywhere)
+    #   ARGUS_ADMIN_CIDR=192.168.0.0/16,100.64.0.0/10
+    # Optional 2FA:  docker compose exec argus /argus totp enable --data /data
     volumes:
       - argus-data:/data
     read_only: true
@@ -40,6 +44,7 @@ services:
     command: ["agent", "--hub", "${ARGUS_HUB:-https://127.0.0.1:7070}", "--pin", "${ARGUS_PIN:-}", "--state", "/state", "--name", "${ARGUS_NAME:-docker-host}"]
     environment:
       ARGUS_TOKEN: ${ARGUS_TOKEN:-}
+      ARGUS_HOSTFS: /host  # report the host's OS, machine-id and filesystems, not the container's
     volumes:
       - argus-agent:/state
       - /var/run/docker.sock:/var/run/docker.sock:ro

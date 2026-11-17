@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -83,7 +84,7 @@ func runAgent(c *config) {
 	}
 	a.st = a.static()
 	a.sendStatic = true
-	a.ex = &executor{manage: c.Manage, docker: a.docker, onDone: a.addResult, refresh: func() {
+	a.ex = &executor{caps: c.caps(), docker: a.docker, onDone: a.addResult, upgrade: a.selfUpdate, refresh: func() {
 		ns := a.static()
 		a.mu.Lock()
 		a.st, a.sendStatic = ns, true
@@ -91,7 +92,7 @@ func runAgent(c *config) {
 	}}
 	os.MkdirAll(c.State, 0o700)
 	a.key = readTrim(filepath.Join(c.State, "agent.key"))
-	logf("argus agent %s → %s (id %s, manage=%v, tls-pin=%v)", a.st.Hostname, a.hub, a.st.ID, c.Manage, c.Pin != "")
+	logf("argus agent %s %s → %s (id %s, caps=%v, tls-pin=%v)", version, a.st.Hostname, a.hub, a.st.ID, c.caps(), c.Pin != "")
 	if strings.HasPrefix(a.hub, "http://") && !isPrivateHost(a.hub) {
 		logf("WARNING: hub URL is plain http over a public network — use https")
 	}
@@ -120,7 +121,8 @@ func (a *agent) static() *Static {
 	if a.cfg.Name != "" {
 		st.Hostname = a.cfg.Name
 	}
-	st.Manage = a.cfg.Manage
+	st.Caps = a.cfg.caps()
+	st.Manage = len(st.Caps) > 0
 	if a.docker != nil {
 		st.Extra["Container engine"] = a.docker.describe()
 	}
@@ -179,6 +181,15 @@ func (a *agent) do(c *http.Client, method, path string, body []byte) (*ReportRes
 	req.Header.Set("Authorization", "Agent "+a.st.ID+":"+a.key)
 	a.mu.Unlock()
 	req.Header.Set("Content-Type", "application/json")
+	if len(body) > 1400 { // compress anything bigger than one packet: cheap, and saves VPS egress
+		var zb bytes.Buffer
+		zw, _ := gzip.NewWriterLevel(&zb, gzip.BestSpeed)
+		zw.Write(body)
+		zw.Close()
+		req.Body = io.NopCloser(bytes.NewReader(zb.Bytes()))
+		req.ContentLength = int64(zb.Len())
+		req.Header.Set("Content-Encoding", "gzip")
+	}
 	res, err := c.Do(req)
 	if err != nil {
 		return nil, err
@@ -200,6 +211,7 @@ func (a *agent) do(c *http.Client, method, path string, body []byte) (*ReportRes
 }
 
 func (a *agent) handle(rr *ReportResp) {
+	detailMode.Store(rr.Detail)
 	for _, cmd := range rr.Cmds {
 		go a.ex.run(cmd)
 	}
@@ -375,10 +387,11 @@ func round2(v float64) float64 { return float64(int64(v*100+0.5)) / 100 }
 // ---------------------------------------------------------------- executor
 
 type executor struct {
-	manage  bool
+	caps    []string
 	docker  *dockerClient
 	onDone  func(Result)
 	refresh func()
+	upgrade func() (string, error)
 }
 
 const maxOutput = 256 << 10
@@ -396,12 +409,22 @@ func (e *executor) run(cmd Command) {
 		r.OK, r.Output = true, "inventory refreshed"
 		return
 	}
-	if !e.manage {
-		r.Output = "management is disabled on this agent (install with --manage to allow it)"
+	if need := capFor(cmd.Kind); need == "" || !hasCap(e.caps, need) {
+		r.Output = fmt.Sprintf("%q is not allowed on this agent (reinstall with --allow %s or --manage)", cmd.Kind, need)
 		r.Code = -1
 		return
 	}
 	switch cmd.Kind {
+	case "upgrade":
+		if e.upgrade == nil {
+			r.Output = "self-update is not available for the hub's built-in agent; reinstall the hub instead"
+			return
+		}
+		out, err := e.upgrade()
+		r.Output, r.OK = out, err == nil
+		if err != nil {
+			r.Output = err.Error()
+		}
 	case "exec":
 		r.Output, r.Code, r.OK = shellExec(cmd.Arg, 5*time.Minute)
 	case "docker":

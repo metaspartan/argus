@@ -2,6 +2,15 @@
 
 **The hundred-eyed watchman for your machines.** Argus monitors and manages a fleet of Apple Silicon Macs, Windows PCs, Linux boxes (amd64, arm64, riscv64, armv7) and VPSes from one live dashboard.
 
+<p align="center">
+  <img src="docs/dashboard-fleet.png" alt="Argus fleet overview" width="100%">
+</p>
+<p align="center">
+  <img src="docs/dashboard-machine.png" alt="Argus machine detail with live charts" width="78%">
+  &nbsp;
+  <img src="docs/dashboard-mobile.png" alt="Argus on a phone" width="19%">
+</p>
+
 - **One static binary, zero dependencies.** It's Go stdlib only, with no cgo, no modules and no runtime. The ~6 MB executable is the hub, the agent and the embedded dashboard.
 - **Nearly free to run.** Agents adapt their cadence to whether anyone is looking:
 
@@ -31,7 +40,7 @@
 - **Containers.** Docker and Podman via their API sockets (Unix socket or Windows named pipe):
   - Every container with compose project, health, ports, and live CPU, memory and network.
   - Start, stop, restart, logs and inspect.
-- **Management** (opt-in per agent): a remote shell/PowerShell console, kill process, container actions, reboot and shut down.
+- **Management** (opt-in per agent, granted per capability): a remote shell/PowerShell console, kill process, container actions, reboot, shut down and **one-click agent updates** across the fleet.
 - **Secure by default.** See [Security](#security).
 
 ## Quick start
@@ -67,7 +76,18 @@ curl -fsSLk --pinnedpubkey 'sha256//<pin>' https://HUB:7070/install.sh | sudo sh
 powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand <…>
 ```
 
-Leave out `--manage` for a read-only agent; on Linux, read-only agents also run in a hardened systemd sandbox. Remove the service with `sudo argus uninstall`.
+`--manage` grants every capability. For finer control, use `--allow` with any of `exec`, `docker`, `kill`, `power` and `update`. For example, `--allow docker,update` gives container control and self-update but no shell. Leave both out for a read-only agent; on Linux, agents without `exec`, `power` or `update` also run in a hardened systemd sandbox.
+
+The installer waits until the agent has enrolled and tells you it's live. Afterwards:
+
+```bash
+argus status                 # service state, hub reachability, enrollment, recent log
+sudo argus uninstall         # remove the service (add --purge to delete keys and data too)
+```
+
+### 3. Keep agents current
+
+When the hub is newer than an agent, the dashboard shows **Update** on that machine and **Update N agents** on the fleet page. The agent downloads its binary from the hub over its pinned connection, checks the SHA-256 the hub sends with it, swaps the binary in place and restarts. This requires the `update` capability.
 
 ## Where to put the hub
 
@@ -84,8 +104,10 @@ Agents always **dial out** to the hub. They need no open ports, and NAT is fine.
 | Transport | TLS by default with an auto-generated ECDSA P-256 certificate. Installers (`curl --pinnedpubkey`, PowerShell cert hash check) and agents **pin its public key**, so no CA is needed and a man-in-the-middle can't impersonate the hub. Bring your own cert with `--tls-cert/--tls-key`. |
 | Dashboard | A separate **admin token** that never appears in install commands. Sessions are random server-side IDs (stored hashed) in an `HttpOnly`, `SameSite=Strict`, `Secure` cookie. State-changing calls require a custom header plus a same-origin check (CSRF). Strict CSP, `X-Frame-Options: DENY`, HSTS. |
 | Agents | The **enroll token** only lets a new machine register. Each machine then gets its own random key, stored `0600` on the agent and as a SHA-256 hash on the hub. "Forget" revokes it, and rotating the enroll token invalidates old install commands without touching enrolled machines. |
-| Abuse | Failed logins, enrollments and agent auth are rate-limited per IP. Request bodies and headers are size-capped. |
-| Management | Off unless the **agent** is started with `--manage`. The agent enforces this, not the hub. Every command, login and enrollment goes to `<data>/audit.log`. |
+| Two-factor | Optional TOTP for dashboard sign-in (`argus totp enable`) using any authenticator app. Codes are replay-protected, and no restart is needed. |
+| Network | `--admin-cidr 192.168.0.0/16,100.64.0.0/10` hides the dashboard from everyone else, for example to keep it on your LAN or Tailscale. Enrollment and agent traffic stay reachable from anywhere. |
+| Abuse | Failed logins, enrollments and agent auth are rate-limited per IP. Request bodies and headers are size-capped, and gzip uploads are size-capped after decompression. |
+| Management | **Capability-based and enforced by the agent:** a compromised or misused hub can't make an agent run anything outside the capabilities granted at install. Self-updates are integrity-checked. Every command, login, enrollment and session revocation goes to `<data>/audit.log`, which is viewable in the dashboard (shield icon) with a "sign out everywhere" button. |
 | Footprint | Hub secrets live in a root/SYSTEM-only data directory. Read-only Linux agents run with `ProtectSystem=strict`, `NoNewPrivileges` and friends. |
 
 ## How it works
@@ -96,6 +118,8 @@ agent ──POST /api/agent/report (JSON, keep-alive)─────────
 ```
 
 - **Cadence is driven by the hub:** 10 s when no dashboard is open, 2 s when one is, and 1 s for the machine being viewed. Agents switch the moment someone opens or closes the dashboard.
+- **Expensive probes scale with attention:** the process table, TCP states and per-container stats run at full rate only for the machine someone has open, and back off 10× otherwise.
+- **Lean streams:** dashboards receive a slim event per machine; the full payload (processes, cores, containers) goes only to whoever is viewing that machine. Agent uploads and dashboard responses are gzip-compressed.
 - **Static inventory** is sent once, then re-sent when NICs or addresses change and every 6 h.
 - **History:** the hub keeps fixed ring buffers in RAM (high-resolution recent history plus 24 h of 1-minute averages). Inventory and the 24 h history are persisted to `nodes.json`.
 
@@ -120,11 +144,21 @@ On macOS, libSystem is called without cgo using the same assembly-trampoline tec
 argus hub      [--listen :7070] [--data DIR] [--tls auto|off] [--tls-cert F --tls-key F]
                [--url https://public:7070] [--host NAME,...] [--no-local] [--manage] [--trust-proxy]
                [--interval 2s] [--idle-interval 10s]
-argus agent    --hub https://HOST:7070 --token ENROLL [--pin sha256/...] [--manage] [--name NAME]
+               [--admin-cidr CIDR,...]
+argus agent    --hub https://HOST:7070 --token ENROLL [--pin sha256/...] [--manage | --allow exec,docker,kill,power,update] [--name NAME]
 argus install  hub|agent [flags]
-argus uninstall
+argus uninstall [--purge]
+argus status
 argus token    [--rotate-admin] [--rotate-enroll]
+argus totp     enable|disable
 argus snapshot                      # this machine's inventory + metrics as JSON
+```
+
+## Development
+
+```bash
+go test ./...      # TOTP (RFC 6238 vectors), certificate pinning, CIDR gate, capabilities, gzip-bomb cap, stream slimming
+./build.sh         # all 9 targets into dist/
 ```
 
 ## Status
@@ -135,4 +169,4 @@ argus snapshot                      # this machine's inventory + metrics as JSON
 
 ## License
 
-MIT
+MIT © Carsen Klock

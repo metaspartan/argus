@@ -108,12 +108,16 @@ func (c *Collector) read(path string) []byte {
 func (c *Collector) Static() *Static {
 	s := baseStatic()
 	s.Kernel = readTrim("/proc/sys/kernel/osrelease")
-	osr := parseKV(readTrim("/etc/os-release"), "=")
+	root := hostFS()
+	if hn := readTrim(root + "/etc/hostname"); root != "" && hn != "" {
+		s.Hostname = hn
+	}
+	osr := parseKV(readTrim(root+"/etc/os-release"), "=")
 	s.Platform = strings.Trim(osr["PRETTY_NAME"], `"`)
 	if s.Platform == "" {
 		s.Platform = "Linux"
 	}
-	s.ID = readTrim("/etc/machine-id")
+	s.ID = readTrim(root + "/etc/machine-id")
 	if s.ID == "" {
 		s.ID = readTrim("/var/lib/dbus/machine-id")
 	}
@@ -913,12 +917,12 @@ func (c *Collector) Collect(tick int) *Metrics {
 	m.FS = c.fsCache
 
 	// Processes
-	if tick%everyProcs == 0 {
+	if heavyTick(tick, everyProcs) {
 		m.Procs, m.NProcs = c.processes()
 	}
 
 	// TCP
-	if tick%everyTCP == 0 {
+	if heavyTick(tick, everyTCP) {
 		c.tcpCache = c.tcpStates()
 	}
 	m.TCP = c.tcpCache
@@ -944,6 +948,13 @@ func (c *Collector) filesystems() []FSStat {
 			continue
 		}
 		dev, mnt := f[0], strings.ReplaceAll(f[1], `\040`, " ")
+		if root := hostFS(); root != "" {
+			// Running in a container with the host's / mounted at $ARGUS_HOSTFS:
+			// report only host filesystems, under their real mount points.
+			if mnt != root && !strings.HasPrefix(mnt, root+"/") {
+				continue
+			}
+		}
 		if seen[dev] || strings.HasPrefix(mnt, "/snap/") || strings.HasPrefix(mnt, "/var/lib/docker") {
 			continue
 		}
@@ -953,6 +964,11 @@ func (c *Collector) filesystems() []FSStat {
 		}
 		seen[dev] = true
 		bs := uint64(st.Bsize)
+		if root := hostFS(); root != "" {
+			if mnt = strings.TrimPrefix(mnt, root); mnt == "" {
+				mnt = "/"
+			}
+		}
 		out = append(out, FSStat{Mount: mnt, Dev: dev, Type: f[2], Total: st.Blocks * bs, Used: (st.Blocks - st.Bfree) * bs})
 	}
 	return out
@@ -1024,3 +1040,7 @@ func (c *Collector) tcpStates() map[string]int {
 	}
 	return m
 }
+
+// hostFS is where the host's root filesystem is mounted when the agent runs
+// in a container (docker-compose "host-agent" profile sets ARGUS_HOSTFS=/host).
+func hostFS() string { return strings.TrimRight(os.Getenv("ARGUS_HOSTFS"), "/") }

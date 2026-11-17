@@ -124,7 +124,7 @@ const valUnit = (s) => { const [v, u] = split(s); return [v, h("small", null, u)
 
 // ------------------------------------------------------------------ state
 const S = {
-  nodes: new Map(), skew: 0, view: lsGet("argus.view") || "grid", q: "",
+  nodes: new Map(), skew: 0, hubVersion: "", view: lsGet("argus.view") || "grid", q: "",
   cards: new Map(), detail: null, pending: new Map(), info: null, es: null, focus: "", live: false, hoverT: null,
 };
 function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
@@ -202,7 +202,14 @@ class Chart {
     }
     this.draw();
   }
-  pad() { return this.spark ? { l: 0, r: 0, t: 4, b: 2 } : { l: 52, r: 10, t: 12, b: 24 }; }
+  pad() {
+    if (this.spark) return { l: 0, r: 0, t: 4, b: 2 };
+    // Size the y-axis gutter to its widest label so values are never clipped.
+    const x = this.c.getContext("2d"); x.font = "10.5px " + css("--mono");
+    const max = this.max ?? niceMax(Math.max(1, ...this.data.flatMap((p) => this.series.map((s) => p[s.i] || 0))));
+    let w = 0; for (let g = 0; g <= 4; g++) w = Math.max(w, x.measureText(this.fmtY((max * g) / 4)).width);
+    return { l: Math.ceil(w) + 14, r: 10, t: 12, b: 24 };
+  }
   onMove(e) {
     const r = this.c.getBoundingClientRect(), d = this.data; if (d.length < 2) return;
     const pad = this.pad(), w = r.width - pad.l - pad.r;
@@ -312,6 +319,11 @@ function maxTemp(m) {
   for (const g of m?.gpus || []) t = Math.max(t, g.temp || 0); return t || null;
 }
 const title = (n) => n.static?.hostname || n.id.slice(0, 8);
+const ALLCAPS = ["exec", "docker", "kill", "power", "update"];
+const capsOf = (st) => st?.caps || (st?.manage ? ALLCAPS : []);
+const can = (st, cap) => capsOf(st).includes(cap);
+const capHint = (cap) => `Not allowed on this agent. Reinstall it with --allow ${cap} or --manage.`;
+const outdated = (n) => !n.local && S.hubVersion && n.static?.agent && n.static.agent !== S.hubVersion;
 const subtitle = (st) => (st ? [st.platform, st.model].filter(Boolean).join(" · ") : "");
 const barColor = (v) => (v > 90 ? "var(--bad)" : v > 75 ? "var(--warn)" : null);
 const ctrCount = (m) => { const c = m?.docker?.containers || []; return [c.filter((x) => x.state === "running").length, c.length]; };
@@ -331,7 +343,7 @@ function renderSummary() {
   $("#summary").replaceChildren(
     pill("server", h("b", null, `${on.length}/${nodes.length}`), "online"),
     pill("cpu", h("b", null, threads), "threads", h("b", null, fmt.pct(threads ? cpuW / threads : 0) + "%")),
-    pill("mem", h("b", null, fmt.bytes(memUsed, 0)), "of", fmt.bytes(mem, 0)),
+    pill("mem", h("b", null, fmt.bytes(memUsed, 0)), "of " + fmt.bytes(mem, 0)),
     gpus ? pill("gpu", h("b", null, gpus), "GPUs") : null,
     ctrs ? pill("box", h("b", null, `${run}/${ctrs}`), "containers") : null,
     pill("net", h("b", { style: { color: "var(--rx)" } }, "↓ " + fmt.bits(rx)), h("b", { style: { color: "var(--tx)" } }, "↑ " + fmt.bits(tx))),
@@ -359,10 +371,15 @@ function renderFleet() {
       h("button", { class: "btn primary", onclick: showAdd }, ic("plus"), "Add a machine")));
     return;
   }
-  if (S.view === "list") return renderList(nodes);
+  const all = [...S.nodes.values()], online = all.filter((n) => status(n) === "on").length;
+  const stale = all.filter((n) => outdated(n) && can(n.static, "update") && status(n) === "on");
+  const head = h("div", { class: "fleet-head" },
+    h("div", null, h("h1", null, "Fleet"), h("p", null, `${all.length} machine${all.length === 1 ? "" : "s"} · ${online} online` + (S.q ? ` · ${nodes.length} shown` : ""))),
+    h("div", { class: "right" }, stale.length ? h("button", { class: "btn tint", title: `Agents older than the hub (${S.hubVersion})`, onclick: () => confirmAct(`Update ${stale.length} agent${stale.length > 1 ? "s" : ""} to ${S.hubVersion}?`, "Each agent downloads the new binary from this hub over its pinned connection, verifies the SHA-256 and restarts in place. Monitoring blinks for a few seconds.", () => stale.forEach((n) => sendCmd(n.id, "upgrade"))) }, ic("restart"), `Update ${stale.length} agent${stale.length > 1 ? "s" : ""}`) : null));
+  if (S.view === "list") { renderList(nodes); $("#main").prepend(head); return; }
   const grid = h("div", { class: "grid" });
   for (const n of nodes) grid.append(buildCard(n));
-  main.replaceChildren(grid);
+  main.replaceChildren(head, grid);
 }
 
 function buildCard(n) {
@@ -407,7 +424,8 @@ function updateCard(n) {
   if (m?.sysW) chips.push(["zap", m.sysW + " W"]);
   if (m?.battery) chips.push(["battery", Math.round(m.battery.pct) + "%" + (m.battery.charging ? " ⚡" : "")]);
   if (st.virt) chips.push(["monitor", st.virt, "warn"]);
-  if (st.manage) chips.push(["sliders", "managed"]);
+  if (capsOf(st).length) chips.push(["sliders", capsOf(st).length === 5 ? "managed" : capsOf(st).join(" · ")]);
+  if (outdated(n)) chips.push(["restart", "v" + st.agent, "warn"]);
   const key = JSON.stringify(chips);
   if (r.foot.dataset.k !== key) {
     r.foot.dataset.k = key;
@@ -459,11 +477,11 @@ async function renderDetail(id, tab = "overview") {
   if (!S.detail || S.detail.id !== id) return;
   const st = n.static || {}, D = S.detail;
   const act = (icon, label, opts) => h("button", { class: "btn sm " + (opts.cls || ""), disabled: opts.disabled, title: opts.title || "", onclick: opts.onclick }, ic(icon), h("span", null, label));
-  const noManage = !st.manage ? "Install this agent with --manage to enable" : "";
   const actions = h("div", { class: "actions" },
-    act("term", "Console", { disabled: !st.manage, title: noManage, onclick: () => (location.hash = `#/n/${id}/console`) }),
-    act("reboot", "Reboot", { cls: "danger", disabled: !st.manage, title: noManage, onclick: () => confirmAct("Reboot " + title(n) + "?", "The machine will restart immediately.", () => sendCmd(id, "reboot")) }),
-    act("power", "Shut down", { cls: "danger", disabled: !st.manage, title: noManage, onclick: () => confirmAct("Shut down " + title(n) + "?", "You'll need physical or out-of-band access to power it back on.", () => sendCmd(id, "shutdown")) }),
+    outdated(n) ? act("restart", `Update to ${S.hubVersion}`, { cls: "tint", disabled: !can(st, "update"), title: can(st, "update") ? `Agent runs ${st.agent}` : capHint("update"), onclick: () => confirmAct(`Update ${title(n)} to ${S.hubVersion}?`, "The agent downloads the new binary from this hub, verifies its SHA-256 and restarts in place.", () => sendCmd(id, "upgrade")) }) : null,
+    act("term", "Console", { disabled: !can(st, "exec"), title: can(st, "exec") ? "" : capHint("exec"), onclick: () => (location.hash = `#/n/${id}/console`) }),
+    act("reboot", "Reboot", { cls: "danger", disabled: !can(st, "power"), title: can(st, "power") ? "" : capHint("power"), onclick: () => confirmAct("Reboot " + title(n) + "?", "The machine will restart immediately.", () => sendCmd(id, "reboot")) }),
+    act("power", "Shut down", { cls: "danger", disabled: !can(st, "power"), title: can(st, "power") ? "" : capHint("power"), onclick: () => confirmAct("Shut down " + title(n) + "?", "You'll need physical or out-of-band access to power it back on.", () => sendCmd(id, "shutdown")) }),
     act("trash", "Forget", { cls: "ghost", title: "Remove from Argus and revoke this agent's key", onclick: () => confirmAct("Forget " + title(n) + "?", "Its agent key is revoked. It can only come back by enrolling again with the enroll token.", async () => { await api("/api/node/" + id, { method: "DELETE" }); S.nodes.delete(id); location.hash = "#/"; }) }));
   const counts = { processes: n.last?.nprocs, devices: (st.devices || []).length, network: (n.last?.net || []).length, containers: ctrCount(n.last)[1] };
   D.refs.dot = h("span", { class: "dot" }); D.refs.sub = h("div", { class: "sub" });
@@ -547,7 +565,7 @@ function buildOverview(n) {
     K.gpu.v.replaceChildren(gp == null ? "–" : fmt.pct(gp), h("small", null, gp == null ? "" : "%")); K.gpu.ring.set(gp);
     K.gpu.s.textContent = (m.gpus || []).map((g) => g.name).join(", ") || (st.gpus || []).map((g) => g.name).join(", ") || "none detected";
     const [rx, tx] = netSum(n);
-    K.net.v.replaceChildren(...valUnit(fmt.bits(rx))); K.net.s.textContent = "↓ in · ↑ " + fmt.bits(tx) + (m.tcp?.established ? ` · ${m.tcp.established} TCP` : "");
+    K.net.v.replaceChildren(...valUnit(fmt.bits(rx))); K.net.s.textContent = "in · out " + fmt.bits(tx) + (m.tcp?.established ? ` · ${m.tcp.established} connections` : "");
     let dr = 0, dw = 0; for (const d of m.disks || []) { dr += d.r; dw += d.w; }
     K.disk.v.replaceChildren(...valUnit(fmt.rate(dr + dw))); K.disk.s.textContent = `read ${fmt.rate(dr)} · write ${fmt.rate(dw)}`;
     if (m.sysW) K.sys.v.replaceChildren(String(m.sysW), h("small", null, "W"));
@@ -634,7 +652,7 @@ function buildContainers(n) {
   const seg = h("div", { class: "seg" }, [["all", "All"], ["running", "Running"], ["stopped", "Stopped"]].map(([k, l]) => h("button", { class: D.ctrFilter === k ? "on" : "", onclick: (e) => { D.ctrFilter = k; $$("button", seg).forEach((b) => b.classList.toggle("on", b === e.currentTarget)); D.update(S.nodes.get(n.id), true); } }, l)));
   D.body.replaceChildren(summary, h("div", { class: "filterbar" }, h("label", { class: "search" }, ic("search"), q), seg), out);
   const rowsById = new Map();
-  const cact = (icon, label, op, c, cls) => h("button", { class: "btn icon sm ghost " + (cls || ""), title: label, "aria-label": label, disabled: !st.manage, onclick: (e) => {
+  const cact = (icon, label, op, c, cls) => h("button", { class: "btn icon sm ghost " + (cls || ""), title: can(st, "docker") ? label : capHint("docker"), "aria-label": label, disabled: !can(st, "docker"), onclick: (e) => {
     e.stopPropagation();
     if (op === "stop" || op === "restart" || op === "kill") confirmAct(`${label} ${c.name}?`, `${c.image} on ${title(n)}`, () => sendCmd(n.id, "docker", op + " " + c.id));
     else sendCmd(n.id, "docker", op + " " + c.id, op === "logs" || op === "inspect" ? { view: `${c.name} · ${op}` } : null);
@@ -664,7 +682,7 @@ function buildContainers(n) {
       (!qq || [c.name, c.image, c.project, c.service, c.status, ...(c.ports || [])].join(" ").toLowerCase().includes(qq)));
     const groups = new Map();
     for (const c of list) { const g = c.project || ""; if (!groups.has(g)) groups.set(g, []); groups.get(g).push(c); }
-    const key = [...groups.entries()].map(([g, cs]) => g + ":" + cs.map((c) => c.id + c.state).join(",")).join("|") + st.manage;
+    const key = [...groups.entries()].map(([g, cs]) => g + ":" + cs.map((c) => c.id + c.state).join(",")).join("|") + capsOf(st);
     if (out.dataset.k !== key) {
       out.dataset.k = key; rowsById.clear();
       out.replaceChildren(...[...groups.entries()].sort((a, b) => (a[0] === "") - (b[0] === "") || a[0].localeCompare(b[0])).map(([g, cs]) =>
@@ -688,7 +706,7 @@ function buildContainers(n) {
         r.ports.dataset.k = pk;
         r.ports.replaceChildren(...(c.ports || []).slice(0, 4).map((p) => h("span", { class: "tag" }, ic("plug"), p)), c.health ? h("span", { class: "tag " + (c.health === "healthy" ? "ok" : c.health === "unhealthy" ? "bad" : "warn") }, ic("heart"), c.health) : null);
       }
-      const ak = c.state + st.manage;
+      const ak = c.state + capsOf(st);
       if (r.acts.dataset.k !== ak) {
         r.acts.dataset.k = ak;
         r.acts.replaceChildren(
@@ -721,7 +739,7 @@ function buildProcesses(n) {
       h("td", { class: "num muted" }, p.pid), h("td", null, p.name), h("td", { class: "muted hide-sm" }, p.user || ""),
       h("td", { class: "num" }, h("span", { class: "mini-bar" }, h("i", { style: { width: Math.min(100, p.cpu) + "%", background: "var(--cpu)" } })), fmt.pct(p.cpu) + "%"),
       h("td", { class: "num" }, fmt.bytes(p.mem)),
-      h("td", null, st.manage ? h("button", { class: "btn icon sm ghost danger", title: "Kill", "aria-label": "Kill " + p.name, onclick: () => confirmAct(`Kill ${p.name} (${p.pid})?`, "on " + title(n), () => sendCmd(n.id, "kill", String(p.pid))) }, ic("x")) : null))));
+      h("td", null, can(st, "kill") ? h("button", { class: "btn icon sm ghost danger", title: "Kill", "aria-label": "Kill " + p.name, onclick: () => confirmAct(`Kill ${p.name} (${p.pid})?`, "on " + title(n), () => sendCmd(n.id, "kill", String(p.pid))) }, ic("x")) : null))));
   };
 }
 
@@ -806,7 +824,7 @@ const QUICK = {
 
 function buildConsole(n) {
   const D = S.detail, st = n.static || {}, ps1 = st.os === "windows";
-  const out = h("div", { class: "out" }), input = h("input", { placeholder: st.manage ? (ps1 ? "PowerShell command…" : "shell command…") : "management is disabled on this agent", disabled: !st.manage, autocomplete: "off", spellcheck: "false", "aria-label": "Command" });
+  const out = h("div", { class: "out" }), input = h("input", { placeholder: can(st, "exec") ? (ps1 ? "PowerShell command…" : "Shell command…") : "Remote commands are not allowed on this agent", disabled: !can(st, "exec"), autocomplete: "off", spellcheck: "false", "aria-label": "Command" });
   const hist = []; let hi = 0;
   input.addEventListener("keydown", (e) => {
     if (e.key === "ArrowUp" && hist.length) { hi = Math.max(0, hi - 1); input.value = hist[hi]; e.preventDefault(); }
@@ -815,11 +833,11 @@ function buildConsole(n) {
   const run = (cmd) => sendCmd(n.id, "exec", cmd);
   const form = h("form", { onsubmit: (e) => { e.preventDefault(); const v = input.value.trim(); if (!v) return; hist.push(v); hi = hist.length; input.value = ""; run(v); } }, h("span", { class: "prompt" }, ps1 ? "PS>" : "$"), input);
   D.body.replaceChildren(
-    st.manage ? h("div", { class: "quick" }, (QUICK[st.os] || QUICK.linux).map((q) => h("button", { class: "btn sm", onclick: () => run(q) }, ic("term", "sm"), h("span", { class: "mono", style: { fontSize: "11.5px" } }, q.length > 42 ? q.slice(0, 40) + "…" : q))))
-      : h("div", { class: "notice" }, ic("lock"), h("div", null, h("b", null, "Remote management is off for this machine. "), h("span", { class: "muted" }, "Reinstall the agent with --manage (Windows: tick “Allow remote management” in Add machine) to enable the console, containers, kill, reboot and shutdown."))),
+    can(st, "exec") ? h("div", { class: "quick" }, (QUICK[st.os] || QUICK.linux).map((q) => h("button", { class: "btn sm", onclick: () => run(q) }, ic("term", "sm"), h("span", { class: "mono", style: { fontSize: "11.5px" } }, q.length > 42 ? q.slice(0, 40) + "…" : q))))
+      : h("div", { class: "notice" }, ic("lock"), h("div", null, h("b", null, "Remote commands are off for this machine. "), h("span", { class: "muted" }, "Reinstall the agent with --allow exec (or --manage for everything) to use the console. Capabilities can be granted individually: exec, docker, kill, power, update."))),
     h("div", { class: "console" }, out, form));
   D.update = (n, force) => {
-    const rs = (n.results || []).filter((r) => r.kind === "exec" || r.kind === "kill" || r.kind === "reboot" || r.kind === "shutdown");
+    const rs = (n.results || []).filter((r) => ["exec", "kill", "reboot", "shutdown", "upgrade"].includes(r.kind));
     const pend = [...S.pending.values()].filter((p) => p.node === n.id && p.kind === "exec");
     const k = rs.length + "|" + pend.length;
     if (!force && out.dataset.n === k) return;
@@ -876,7 +894,7 @@ async function showAdd() {
   const m = modal(h("div", { class: "dialog" },
     h("h2", null, ic("plus"), "Add a machine"), h("p", null, "Run one line on the machine. Argus installs as a system service (systemd, OpenRC, launchd or Task Scheduler), enrolls with a per-machine key, and starts streaming within seconds."),
     h("div", { class: "secrow" }, ...sec),
-    h("label", { class: "check" }, h("input", { type: "checkbox", checked: true, onchange: (e) => { manage = e.target.checked; render(); } }), ic("sliders"), "Allow remote management (console, containers, kill, reboot, shutdown)"),
+    h("label", { class: "check" }, h("input", { type: "checkbox", checked: true, onchange: (e) => { manage = e.target.checked; render(); } }), h("div", null, "Allow remote management", h("small", null, "Console, container actions, kill, reboot and self-update. For finer control, replace --manage with e.g. --allow docker,update."))),
     h("div", { class: "field" }, h("label", null, ic("term", "sm"), "macOS · Linux · VPS (amd64, arm64, riscv64, armv7)"), unix),
     h("div", { class: "field" }, h("label", null, OS.windows ? h("span", { html: OS.windows, style: { width: "13px", display: "inline-flex" } }) : null, "Windows (Admin terminal: cmd, PowerShell or Windows Terminal)"), win),
     h("details", null, h("summary", null, "Show the Windows script before running it"), winSrc),
@@ -887,20 +905,44 @@ async function showAdd() {
       h("button", { class: "btn", onclick: () => (m.hidden = true) }, "Done"))));
 }
 
+// ------------------------------------------------------------------ security & audit
+async function showSecurity() {
+  let a;
+  try { a = await api("/api/audit"); } catch { return; }
+  const stat = (icon, label, value, ok) => h("div", { class: "stat" }, h("label", null, ic(icon, "sm"), label), h("b", { style: { color: ok ? "var(--ok)" : "var(--warn)" } }, value));
+  const label = (act) => ({ login: "Signed in", "login-failed": "Failed sign-in", enroll: "Machine enrolled", "enroll-rejected": "Enrollment rejected", "enroll-rotate": "Enroll token rotated", forget: "Machine forgotten", "sessions-revoked": "All sessions revoked" }[act] || act.replace("cmd:", "Command · "));
+  const bad = (act) => /failed|rejected/.test(act);
+  const m = modal(h("div", { class: "dialog wide" },
+    h("h2", null, ic("shield"), "Security"), h("p", null, "How this hub is protected, and everything that happened on it."),
+    h("div", { class: "statgrid" },
+      stat("lock", "Transport", a.tls === "off" ? "TLS off (proxy)" : a.tls === "cert" ? "TLS · your certificate" : "TLS · pinned certificate", a.tls !== "off"),
+      stat("key", "Two-factor sign-in", a.totp ? "On" : "Off: argus totp enable", a.totp),
+      stat("globe", "Dashboard network", a.adminCidr || "Any: set --admin-cidr", !!a.adminCidr)),
+    h("h3", null, "Audit log"),
+    h("div", { class: "audit" }, (a.entries || []).length ? a.entries.map((e) => h("div", null, h("span", { class: "t" }, new Date(e.t).toLocaleString()), h("span", { class: "a" + (bad(e.action) ? " bad" : "") }, label(e.action)),
+      h("span", { class: "d", title: `${e.ip} ${e.node || ""} ${e.detail || ""}` }, [e.ip, S.nodes.get(e.node) ? title(S.nodes.get(e.node)) : e.node, e.detail].filter(Boolean).join(" · ")))) : h("div", null, "Nothing yet.")),
+    h("div", { class: "foot" },
+      h("button", { class: "btn danger", onclick: () => confirmAct("Sign out every session?", "Everyone, including you, will need the admin token (and 2FA code) again.", async () => { await api("/api/sessions/revoke", { method: "POST" }); location.reload(); }) }, ic("logout"), "Sign out everywhere"),
+      h("button", { class: "btn", onclick: () => (m.hidden = true) }, "Done"))));
+}
+
 // ------------------------------------------------------------------ login
 function showLogin() {
   if ($("#login")) return;
-  closeDetail(); setLive(false); S.es?.close(); S.es = null;
+  closeDetail(); setLive(false); S.es?.close(); S.es = null; document.body.classList.add("locked");
   $("#summary").replaceChildren();
-  const inp = h("input", { class: "input", type: "password", placeholder: "admin token", autocomplete: "current-password", "aria-label": "Admin token" });
+  const inp = h("input", { class: "input", type: "password", placeholder: "Admin token", autocomplete: "current-password", "aria-label": "Admin token" });
+  const code = h("input", { class: "input", inputmode: "numeric", pattern: "[0-9]*", maxlength: "6", placeholder: "6-digit code", autocomplete: "one-time-code", "aria-label": "Two-factor code", style: { textAlign: "center", letterSpacing: ".3em" } });
+  const codeField = h("div", { class: "field", hidden: true }, code);
+  fetch("/api/auth").then((r) => r.json()).then((a) => { if (a.totp) codeField.hidden = false; }).catch(() => {});
   const err = h("div", { class: "muted", style: { minHeight: "22px", fontSize: "13px" } });
   $("#main").replaceChildren(h("div", { class: "login", id: "login" }, h("div", { class: "dialog" },
-    h("h2", null, ic("lock"), "Sign in to Argus"), h("p", null, "Enter the hub's admin token. The hub prints it on first start and keeps it in admin.token in its data folder (or run: argus token)."),
+    h("div", { class: "mark", html: $(".brand svg").outerHTML }), h("h2", null, "Sign in to Argus"), h("p", null, "Enter the hub's admin token. Run argus token on the hub to see it."),
     h("form", { onsubmit: async (e) => {
       e.preventDefault();
-      const r = await fetch("/api/login", { method: "POST", credentials: "same-origin", headers: { "X-Argus": "1", "Content-Type": "application/json" }, body: JSON.stringify({ token: inp.value.trim() }) });
-      if (r.ok) location.reload(); else err.textContent = r.status === 429 ? "Too many attempts. Wait a few minutes." : "That token didn't work.";
-    } }, h("div", { class: "field" }, inp), err, h("button", { class: "btn primary", style: { width: "100%", height: "42px" } }, ic("eye"), "Sign in")))));
+      const r = await fetch("/api/login", { method: "POST", credentials: "same-origin", headers: { "X-Argus": "1", "Content-Type": "application/json" }, body: JSON.stringify({ token: inp.value.trim(), code: code.value.trim() }) });
+      if (r.ok) location.reload(); else err.textContent = r.status === 429 ? "Too many attempts. Wait a few minutes." : codeField.hidden ? "That token didn't work." : "Token or code didn't work.";
+    } }, h("div", { class: "field" }, inp), codeField, err, h("button", { class: "btn primary", style: { width: "100%", height: "42px" } }, ic("eye"), "Sign in")))));
   setTimeout(() => inp.focus(), 30);
 }
 
@@ -964,6 +1006,7 @@ function connect() {
     if (n) { n.results = (n.results || []).concat(r).slice(-100); if (S.detail?.id === v.id) updateDetail(n, true); }
     if (p?.view) showOutput(p.view, r.output);
     else if (r.kind !== "exec" && p) toast(`${title(n || { id: v.id })}: ${r.output}`, !r.ok);
+    if (r.kind === "upgrade" && r.ok) setTimeout(load, 8000);
   });
   es.addEventListener("gone", (e) => { S.nodes.delete(JSON.parse(e.data).id); if (!S.detail) renderFleet(); });
   es.onerror = () => { setLive(false); if (es.readyState === 2) setTimeout(() => S.es === es && connect(), 3000); };
@@ -971,7 +1014,7 @@ function connect() {
 
 async function load() {
   const r = await api("/api/nodes");
-  S.skew = r.now - Date.now();
+  S.skew = r.now - Date.now(); S.hubVersion = r.version || "";
   const seen = new Set();
   for (const v of r.nodes) { ingestNode(v); seen.add(v.id); }
   for (const id of S.nodes.keys()) if (!seen.has(id)) S.nodes.delete(id);
@@ -1007,6 +1050,8 @@ $("#addIc").replaceWith(ic("plus"));
 $("#logoutBtn").append(ic("logout"));
 $("#logoutBtn").addEventListener("click", async () => { await fetch("/api/logout", { method: "POST", headers: { "X-Argus": "1" } }); location.reload(); });
 $("#addBtn").addEventListener("click", showAdd);
+$("#secBtn").append(ic("shield"));
+$("#secBtn").addEventListener("click", showSecurity);
 $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") e.target.hidden = true; });
 
 load().catch(() => {});

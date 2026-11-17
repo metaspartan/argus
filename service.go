@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -154,6 +155,11 @@ func installService(role string, args []string) {
 	}
 	if c.Manage {
 		argv = append(argv, "--manage")
+	} else if caps := c.caps(); len(caps) > 0 && role == "agent" {
+		argv = append(argv, "--allow", strings.Join(caps, ","))
+	}
+	if c.AdminCIDR != "" && role == "hub" {
+		argv = append(argv, "--admin-cidr", c.AdminCIDR)
 	}
 	if c.Interval != 2*time.Second {
 		argv = append(argv, "--interval", c.Interval.String())
@@ -165,7 +171,13 @@ func installService(role string, args []string) {
 		argv = append(argv, "--name", c.Name)
 	}
 	svc := "argus-" + role
-	hardened := role == "agent" && !c.Manage
+	caps := c.caps()
+	hardened := role == "agent" && !hasCap(caps, "exec") && !hasCap(caps, "power") && !hasCap(caps, "update")
+	if role == "agent" {
+		os.Remove(filepath.Join(dataDir, "agent.key")) // fresh enrollment on (re)install
+		cfg, _ := json.MarshalIndent(map[string]any{"hub": c.Hub, "pin": c.Pin, "name": c.Name, "caps": caps, "installed": time.Now().Format(time.RFC3339), "version": version}, "", "  ")
+		os.WriteFile(filepath.Join(dataDir, "agent.json"), cfg, 0o600)
+	}
 
 	switch runtime.GOOS {
 	case "linux", "freebsd":
@@ -177,7 +189,24 @@ func installService(role string, args []string) {
 	default:
 		fatal("service install not supported on %s", runtime.GOOS)
 	}
-	fmt.Printf("✓ argus %s installed and started (%s)\n", role, svc)
+	fmt.Printf("✓ argus %s %s installed and started (%s)\n", role, version, svc)
+	if role == "agent" {
+		ok := false
+		for i := 0; i < 40 && !ok; i++ {
+			time.Sleep(500 * time.Millisecond)
+			ok = readTrim(filepath.Join(dataDir, "agent.key")) != ""
+		}
+		if ok {
+			fmt.Printf("✓ enrolled with %s — this machine is now live in the dashboard\n", c.Hub)
+		} else {
+			fmt.Printf("! not enrolled yet. Check: argus status   (the agent keeps retrying in the background)\n")
+		}
+		if len(caps) > 0 {
+			fmt.Printf("  remote management: %s\n", strings.Join(caps, ", "))
+		} else {
+			fmt.Printf("  read-only agent (sandboxed); reinstall with --manage or --allow to enable actions\n")
+		}
+	}
 	if role == "hub" {
 		scheme := "https"
 		if c.TLS == "off" && c.TLSCert == "" {
@@ -190,6 +219,10 @@ func installService(role string, args []string) {
 		}
 		fmt.Printf("  dashboard:    %s\n  admin token:  %s   (dashboard login)\n  enroll token: %s   (agent installs — see 'Add machine' in the dashboard)\n",
 			base, readTrim(filepath.Join(dataDir, "admin.token")), readTrim(filepath.Join(dataDir, "enroll.token")))
+		fmt.Printf("  2FA:          sudo argus totp enable   (recommended for internet-facing hubs)\n")
+		if out, err := exec.Command("ufw", "status").Output(); err == nil && strings.Contains(string(out), "Status: active") {
+			fmt.Printf("  firewall:     ufw is active — allow agents in with:  sudo ufw allow %s/tcp\n", port)
+		}
 	}
 }
 
@@ -380,7 +413,7 @@ func installWindows(svc, bin string, argv []string, role, listen string) {
 	}
 }
 
-func uninstallService() {
+func uninstallService(purge bool) {
 	if !isAdmin() {
 		fatal("uninstall needs root / Administrator")
 	}
@@ -408,5 +441,73 @@ func uninstallService() {
 		exec.Command("systemctl", "daemon-reload").Run()
 		os.Remove(binPath())
 	}
-	fmt.Println("✓ argus services removed (hub data kept in " + systemDataDir() + ")")
+	if purge {
+		os.RemoveAll(systemDataDir())
+		os.RemoveAll("/etc/argus")
+		fmt.Println("✓ argus services removed and all data, keys and tokens deleted")
+		return
+	}
+	fmt.Println("✓ argus services removed (data kept in " + systemDataDir() + "; use --purge to delete)")
+}
+
+// statusCmd prints the local service state and checks the hub connection.
+func statusCmd(c *config) {
+	dir := systemDataDir()
+	if !isAdmin() {
+		dir = c.Data
+	}
+	fmt.Printf("argus %s %s/%s\n", version, runtime.GOOS, runtime.GOARCH)
+	for _, svc := range []string{"argus-agent", "argus-hub"} {
+		state := "not installed"
+		switch runtime.GOOS {
+		case "windows":
+			task := map[string]string{"argus-agent": "Argus Agent", "argus-hub": "Argus Hub"}[svc]
+			if out, err := exec.Command("schtasks", "/Query", "/TN", task, "/FO", "LIST").Output(); err == nil {
+				for _, l := range strings.Split(string(out), "\n") {
+					if strings.HasPrefix(strings.TrimSpace(l), "Status:") {
+						state = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(l), "Status:"))
+					}
+				}
+			}
+		case "darwin":
+			label := "dev.argus." + strings.TrimPrefix(svc, "argus-")
+			if err := exec.Command("launchctl", "print", "system/"+label).Run(); err == nil {
+				state = "loaded"
+			}
+		default:
+			if out, err := exec.Command("systemctl", "is-active", svc).Output(); err == nil || len(out) > 0 {
+				if s := strings.TrimSpace(string(out)); s != "" && s != "inactive" || err == nil {
+					state = s
+				}
+			}
+		}
+		fmt.Printf("  %-12s %s\n", svc, state)
+	}
+	var ac struct {
+		Hub, Pin string
+		Caps     []string
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "agent.json")); err == nil && json.Unmarshal(b, &ac) == nil && ac.Hub != "" {
+		fmt.Printf("  hub          %s\n", ac.Hub)
+		if ac.Pin != "" {
+			fmt.Printf("  cert pin     %s\n", ac.Pin)
+		}
+		enrolled := readTrim(filepath.Join(dir, "agent.key")) != ""
+		fmt.Printf("  enrolled     %v\n  caps         %v\n", enrolled, ac.Caps)
+		cl := &http.Client{Timeout: 6 * time.Second, Transport: &http.Transport{TLSClientConfig: pinnedTLS(ac.Pin)}}
+		if res, err := cl.Get(strings.TrimRight(ac.Hub, "/") + "/healthz"); err != nil {
+			fmt.Printf("  reachable    NO — %v\n", err)
+		} else {
+			res.Body.Close()
+			fmt.Printf("  reachable    yes (HTTP %d)\n", res.StatusCode)
+		}
+	}
+	if readTrim(filepath.Join(dir, "admin.token")) != "" {
+		fmt.Printf("  hub data     %s (2FA %v)\n", dir, totpEnabled(dir))
+	}
+	if runtime.GOOS == "linux" {
+		if out, err := exec.Command("journalctl", "-u", "argus-agent", "-u", "argus-hub", "-n", "5", "--no-pager", "-o", "cat").Output(); err == nil && len(out) > 0 {
+			fmt.Printf("  recent log:\n%s", out)
+		}
+	}
 }
