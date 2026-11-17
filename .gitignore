@@ -1,0 +1,7 @@
+dist/
+/argus
+/argus.exe
+*.old
+*.new
+*.exe
+

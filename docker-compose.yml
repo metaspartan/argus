@@ -1,0 +1,53 @@
+# Argus hub via Docker Compose.
+#
+#   docker compose up -d
+#   docker compose logs argus | grep -E "admin token|enroll"   # first-run secrets
+#
+# The hub serves the dashboard, the API and agent binaries for every platform
+# on :7070 over TLS (self-signed and pinned by agents). Set ARGUS_URL to the
+# address your machines will use to reach it, e.g. https://203.0.113.10:7070.
+#
+# To also monitor the Docker host itself (including its containers), install
+# the agent on the host with the one-liner from "Add machine", or enable the
+# "host-agent" profile below.
+
+services:
+  argus:
+    build: .
+    image: argus:latest
+    container_name: argus
+    restart: unless-stopped
+    ports:
+      - "7070:7070"
+    environment:
+      ARGUS_URL: ${ARGUS_URL:-}
+    command: ["hub", "--data", "/data", "--dist", "/dist", "--no-local", "--host", "${ARGUS_HOST:-localhost}"]
+    volumes:
+      - argus-data:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+
+  # Optional: run an agent for the Docker host in a container.
+  #   ARGUS_TOKEN=<enroll token> docker compose --profile host-agent up -d
+  host-agent:
+    profiles: ["host-agent"]
+    image: argus:latest
+    restart: unless-stopped
+    network_mode: host   # real host interfaces and traffic
+    pid: host            # real host processes
+    command: ["agent", "--hub", "${ARGUS_HUB:-https://127.0.0.1:7070}", "--pin", "${ARGUS_PIN:-}", "--state", "/state", "--name", "${ARGUS_NAME:-docker-host}"]
+    environment:
+      ARGUS_TOKEN: ${ARGUS_TOKEN:-}
+    volumes:
+      - argus-agent:/state
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+      - /:/host:ro
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  argus-data:
+  argus-agent:
